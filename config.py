@@ -1,7 +1,8 @@
+
+DOC_ID       = "56746"
 BASE_URL     = "https://dongcheyun.com"
 OSS_URL      = "https://oss.dongcheyun.com"
-DOC_URL      = "https://dongcheyun.com/p/52843"
-DOC_ID       = "52843"
+DOC_URL      = f"https://dongcheyun.com/p/{DOC_ID}"
 SYSTEM_TYPE  = "webpage"
 OUTPUT_DIR   = "output"
 COOKIES_FILE = "cookies.json"
