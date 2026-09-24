@@ -13,7 +13,9 @@ python parser.py --node=0a005eed82e84ec78eca8a7e3ece534a
 python translate.py
 
 # Только content.json
-python translate.py --content
+python translate.py --content-force
 
 # Только страницы
 python translate.py --pages
+------------------------
+

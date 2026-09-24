@@ -4,3 +4,6 @@ cookies.json
 *.log
 /output
 .idea
+/build
+/dist
+*.spec

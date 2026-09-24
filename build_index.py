@@ -8,8 +8,11 @@
 
 Возможности:
   - _listing.html — листинг страниц папки с колонкой Title и поиском.
-  - Закладки (localStorage) с комментариями, экспорт / импорт JSON.
-  - Кнопка «Отблагодарить автора» (заглушка: методы оплаты и контакты).
+  - Закладки: в pywebview-режиме хранятся в файле через Python-мост;
+    в обычном браузере / file:// — в localStorage.
+  - Кнопка «Отблагодарить автора» (заглушка).
+  - Кнопка «🌐 В браузере» и ярлычок с адресом локального сервера
+    (работает только при запуске через launcher.py на pywebview).
 """
 import json
 from pathlib import Path
@@ -194,7 +197,7 @@ img, svg, video {
     height: auto !important;
     margin: 14px auto;
     cursor: zoom-in;
-    opacity: 0;
+    opacity: 1;
     transition: opacity .2s ease-in;
     border-radius: 6px;
 }
@@ -577,7 +580,7 @@ INDEX_TEMPLATE = r"""<!DOCTYPE html>
       font-weight: 600; overflow: hidden; text-overflow: ellipsis;
       white-space: nowrap; flex: 1; color: #1f2328; min-width: 120px;
   }
-  #topbar-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  #topbar-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
   #open-external {
       color: #0969da; text-decoration: none; font-size: 12px;
       padding: 4px 8px; border-radius: 4px; white-space: nowrap;
@@ -632,6 +635,24 @@ INDEX_TEMPLATE = r"""<!DOCTYPE html>
       font-size: 11px; font-weight: 600;
   }
   .tb-btn.active .count { background: #ffc107; color: #856404; }
+
+  #server-url {
+      display: none;
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+      font-size: 11px; color: #57606a;
+      padding: 2px 8px;
+      border: 1px dashed #d0d7de;
+      border-radius: 6px;
+      cursor: pointer;
+      max-width: 320px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #server-url:hover {
+      background: #eef5ff; border-color: #0969da; color: #0969da;
+  }
+  #server-url.copied {
+      background: #d4edda; border-color: #28a745; color: #155724;
+  }
 
   /* ---------- Модалки ---------- */
   .modal-back {
@@ -751,6 +772,11 @@ INDEX_TEMPLATE = r"""<!DOCTYPE html>
       background: #fff; border: 1px solid #e6e8eb;
       padding: 1px 5px; border-radius: 4px; font-size: 11.5px;
   }
+  .hint .path {
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+      font-size: 11.5px; color: #24292f; word-break: break-all;
+      display: block; margin-top: 4px;
+  }
 
   /* donate placeholder */
   .donate-body {
@@ -800,6 +826,12 @@ INDEX_TEMPLATE = r"""<!DOCTYPE html>
                   title="Отблагодарить автора">
             ❤️ Отблагодарить
           </button>
+          <button class="tb-btn" id="btn-open-browser" onclick="openInBrowser()"
+                  title="Открыть это же руководство в системном браузере">
+            🌐 В браузере
+          </button>
+          <span id="server-url" onclick="copyServerUrl()"
+                title="Кликните, чтобы скопировать адрес"></span>
           <a id="open-external" href="#" target="_blank">
             открыть в новой вкладке ↗
           </a>
@@ -833,12 +865,13 @@ INDEX_TEMPLATE = r"""<!DOCTYPE html>
         Пока нет закладок.<br>
         Открой страницу и нажми ☆ «В закладку».
       </div>
-      <div class="hint">
+      <div class="hint" id="bm-hint">
         <b>Формат файла закладок:</b> JSON с расширением
         <code>.notes.json</code>.<br>
         Структура:
         <code>{ "version":1, "doc":"&lt;DOC_ID&gt;", "saved":"&lt;ISO&gt;",
         "bookmarks": { "&lt;page-id&gt;": {"comment":"…","ts":1234567890} } }</code>
+        <span class="path" id="bm-path" style="display:none;"></span>
       </div>
     </div>
     <div class="modal-foot">
@@ -847,6 +880,9 @@ INDEX_TEMPLATE = r"""<!DOCTYPE html>
                 title="Скачать закладки в .notes.json">⬇ Экспорт</button>
         <button class="tb-btn" onclick="importBookmarks()"
                 title="Загрузить закладки из .notes.json">⬆ Импорт</button>
+        <button class="tb-btn" id="btn-reveal-bm" onclick="revealBookmarks()"
+                style="display:none;"
+                title="Открыть папку с файлом закладок">📁 Папка</button>
         <button class="tb-btn btn-danger" onclick="clearAllBookmarks()">
           Очистить всё
         </button>
@@ -905,7 +941,7 @@ INDEX_TEMPLATE = r"""<!DOCTYPE html>
 /* ============================================================
    Константы
    ============================================================ */
-var BM_KEY = "bm:__DOC_ID__";
+var BM_KEY = "bm:__DOC_ID__";    // ключ для localStorage (fallback)
 var DOC_ID = "__DOC_ID__";
 var DOC_TITLE = "__TITLE__";
 
@@ -915,6 +951,70 @@ var DOC_TITLE = "__TITLE__";
 var currentPageId = null;
 var currentLang = "ru";   // "ru" | "orig" | "en"
 var bookmarks = {};
+var hostApiReady = false;  // доступен ли pywebview.api
+
+/* ============================================================
+   Хранилище закладок: pywebview API или localStorage
+   ============================================================ */
+
+function hasHostApi() {
+    return !!(window.pywebview && window.pywebview.api &&
+              typeof window.pywebview.api.load_bookmarks === "function");
+}
+
+function loadBookmarks(callback) {
+    if (hasHostApi()) {
+        window.pywebview.api.load_bookmarks().then(function (raw) {
+            try { bookmarks = JSON.parse(raw || "{}") || {}; }
+            catch (e) { bookmarks = {}; }
+            callback && callback();
+        }).catch(function () {
+            bookmarks = {};
+            callback && callback();
+        });
+    } else {
+        try {
+            bookmarks = JSON.parse(localStorage.getItem(BM_KEY) || "{}") || {};
+        } catch (e) { bookmarks = {}; }
+        callback && callback();
+    }
+}
+
+function saveBookmarks() {
+    if (hasHostApi()) {
+        window.pywebview.api.save_bookmarks(JSON.stringify(bookmarks));
+    } else {
+        try { localStorage.setItem(BM_KEY, JSON.stringify(bookmarks)); }
+        catch (e) { /* quota */ }
+    }
+    updateBookmarkUI();
+}
+
+function revealBookmarks() {
+    if (hasHostApi() && typeof window.pywebview.api.reveal_bookmarks === "function") {
+        window.pywebview.api.reveal_bookmarks();
+    }
+}
+
+function refreshStorageHint() {
+    var pathEl = document.getElementById("bm-path");
+    var revealBtn = document.getElementById("btn-reveal-bm");
+    if (!pathEl) return;
+
+    if (hasHostApi() && typeof window.pywebview.api.bookmarks_path === "function") {
+        window.pywebview.api.bookmarks_path().then(function (p) {
+            if (p) {
+                pathEl.textContent = "Файл: " + p;
+                pathEl.style.display = "block";
+            }
+        }).catch(function () {});
+        if (revealBtn) revealBtn.style.display = "";
+    } else {
+        pathEl.textContent = "Хранилище: localStorage браузера (не переносится между машинами).";
+        pathEl.style.display = "block";
+        if (revealBtn) revealBtn.style.display = "none";
+    }
+}
 
 /* ============================================================
    Дерево
@@ -1079,21 +1179,8 @@ function runSearch(q) {
 }
 
 /* ============================================================
-   Закладки
+   UI закладок
    ============================================================ */
-function loadBookmarks() {
-    try {
-        bookmarks = JSON.parse(localStorage.getItem(BM_KEY) || "{}") || {};
-    } catch (e) { bookmarks = {}; }
-}
-
-function saveBookmarks() {
-    try {
-        localStorage.setItem(BM_KEY, JSON.stringify(bookmarks));
-    } catch (e) { /* quota */ }
-    updateBookmarkUI();
-}
-
 function updateBookmarkUI() {
     const ids = Object.keys(bookmarks);
     const cnt = document.getElementById("bm-count");
@@ -1251,6 +1338,7 @@ function refreshBookmarksList() {
 
 function openBookmarks() {
     refreshBookmarksList();
+    refreshStorageHint();
     openModal("bm-modal");
 }
 
@@ -1322,13 +1410,11 @@ function applyImportedBookmarks(data) {
         return;
     }
 
-    // Нормализуем записи
     var normalized = {};
     var count = 0;
     Object.keys(incoming).forEach(function (pid) {
         var v = incoming[pid];
         if (typeof v === "string") {
-            // допускаем простой формат: { "id": "комментарий" }
             normalized[pid] = { comment: v, ts: Date.now() };
         } else if (v && typeof v === "object") {
             normalized[pid] = {
@@ -1354,7 +1440,7 @@ function applyImportedBookmarks(data) {
         "По умолчанию: merge",
         "merge"
     );
-    if (mode === null) return;  // отмена
+    if (mode === null) return;
     mode = (mode || "merge").trim().toLowerCase();
 
     if (mode === "replace") {
@@ -1377,6 +1463,60 @@ function applyImportedBookmarks(data) {
    ============================================================ */
 function openDonate() {
     openModal("donate-modal");
+}
+
+/* ============================================================
+   Открыть во внешнем браузере / показать адрес сервера
+   ============================================================ */
+function openInBrowser() {
+    if (hasHostApi() && typeof window.pywebview.api.open_in_browser === "function") {
+        window.pywebview.api.open_in_browser();
+    } else {
+        window.open(location.href, "_blank", "noopener");
+    }
+}
+
+function copyServerUrl() {
+    var el = document.getElementById("server-url");
+    var text = (el && el.textContent) || "";
+    if (!text) return;
+    var done = function () {
+        el.classList.add("copied");
+        var old = el.textContent;
+        el.textContent = "✓ скопировано";
+        setTimeout(function () { el.classList.remove("copied"); el.textContent = old; }, 1000);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, done);
+    } else {
+        var ta = document.createElement("textarea");
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand("copy"); } catch (e) {}
+        document.body.removeChild(ta); done();
+    }
+}
+
+function refreshServerUrl() {
+    var el = document.getElementById("server-url");
+    var btn = document.getElementById("btn-open-browser");
+    if (!el) return;
+
+    if (hasHostApi() && typeof window.pywebview.api.get_server_url === "function") {
+        window.pywebview.api.get_server_url().then(function (u) {
+            if (u) {
+                el.textContent = u;
+                el.style.display = "inline-block";
+            } else {
+                el.style.display = "none";
+            }
+        }).catch(function () {
+            el.style.display = "none";
+        });
+    } else {
+        el.textContent = location.href;
+        el.style.display = "inline-block";
+        if (btn) btn.style.display = "none";
+    }
 }
 
 /* ============================================================
@@ -1406,22 +1546,46 @@ document.addEventListener("keydown", function (e) {
 /* ============================================================
    Инициализация
    ============================================================ */
-var searchTimer = null;
-document.getElementById("search-input").addEventListener("input", function (e) {
-    var q = e.target.value.trim().toLowerCase();
-    if (searchTimer) clearTimeout(searchTimer);
-    searchTimer = setTimeout(function () { runSearch(q); }, 120);
-});
+(function () {
+    var started = false;
 
-document.getElementById("filepath").addEventListener("click", copyPath);
+    function init() {
+        if (started) return;
+        started = true;
 
-window.addEventListener("DOMContentLoaded", function () {
-    loadBookmarks();
-    buildSearchIndex();
-    updateBookmarkUI();
-    var first = document.querySelector("li.page .page-label");
-    if (first) first.click();
-});
+        loadBookmarks(function () {
+            buildSearchIndex();
+            updateBookmarkUI();
+            refreshServerUrl();
+            var first = document.querySelector("li.page .page-label");
+            if (first) first.click();
+        });
+
+        var searchInput = document.getElementById("search-input");
+        if (searchInput) {
+            var searchTimer = null;
+            searchInput.addEventListener("input", function (e) {
+                var q = e.target.value.trim().toLowerCase();
+                if (searchTimer) clearTimeout(searchTimer);
+                searchTimer = setTimeout(function () { runSearch(q); }, 120);
+            });
+        }
+
+        var fp = document.getElementById("filepath");
+        if (fp) fp.addEventListener("click", copyPath);
+    }
+
+    // pywebview отдаёт мост асинхронно. Ждём pywebviewready, если он есть.
+    if (window.pywebview && window.pywebview.api) {
+        init();
+    } else {
+        window.addEventListener("pywebviewready", init, { once: true });
+        window.addEventListener("DOMContentLoaded", function () {
+            setTimeout(init, 250);
+        });
+        setTimeout(init, 1500);
+    }
+})();
 </script>
 
 </body>
@@ -1430,8 +1594,7 @@ window.addEventListener("DOMContentLoaded", function () {
 
 
 # ============================================================
-# Шаблон _listing.html — листинг папки с колонкой «Заголовок»,
-# поиском, закреплённой шапкой и кнопкой «Открыть»
+# Шаблон _listing.html
 # ============================================================
 
 LISTING_TEMPLATE = """<!DOCTYPE html>
@@ -1662,22 +1825,22 @@ def main():
     if not content_path.exists():
         content_path = out_root / "content.json"
     if not content_path.exists():
-        raise SystemExit(f"❌ Не найден content.json в {out_root}")
+        raise SystemExit(f"Не найден content.json в {out_root}")
 
-    print(f"📂 Источник: {content_path}")
+    print(f"Источник: {content_path}")
     data = json.loads(content_path.read_text(encoding="utf-8"))
 
     title = data.get("title_ru") or data.get("doc_title") or "Руководство"
     title = capitalize_first(title)
     tree = data.get("tree", [])
     if not tree:
-        raise SystemExit("❌ Пустое дерево в content.json")
+        raise SystemExit("Пустое дерево в content.json")
 
     tree_html = render_tree(tree)
 
     # 1. Вшить стили/скрипты просмотрщика во все страницы
     inject_viewer_assets(out_root)
-    print("✅ _viewer.css / _viewer.js вшиты в ru_pages/, pages/, en_pages/")
+    print("_viewer.css / _viewer.js вшиты в ru_pages/, pages/, en_pages/")
 
     # 2. Собрать index.html
     html = (INDEX_TEMPLATE
@@ -1687,9 +1850,9 @@ def main():
 
     index_path = out_root / "index.html"
     index_path.write_text(html, encoding="utf-8")
-    print(f"✅ {index_path}")
+    print(f"{index_path}")
 
-    # 3. Собрать _listing.html (листинг с колонкой «Заголовок»)
+    # 3. Собрать _listing.html
     pages = collect_pages(tree)
     listing_html = (LISTING_TEMPLATE
                     .replace("__TITLE__", escape(title))
@@ -1697,10 +1860,10 @@ def main():
                              json.dumps(pages, ensure_ascii=False)))
     listing_path = out_root / "_listing.html"
     listing_path.write_text(listing_html, encoding="utf-8")
-    print(f"✅ {listing_path}  (страниц: {len(pages)})")
+    print(f"{listing_path}  (страниц: {len(pages)})")
 
-    print(f"\nОткрой:")
-    print(f"   file:///{index_path.resolve().as_posix()}")
+    print("\nГотово. Открой index.html через launcher.py "
+          "или напрямую в браузере.")
 
 
 if __name__ == "__main__":

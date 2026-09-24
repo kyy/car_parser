@@ -7,16 +7,20 @@
   которые Google Translate Element по умолчанию игнорирует — через
   постобработку: находим оставшиеся CJK, переводим отдельно, вставляем.
 - Строка/страница считается переведённой ("ok") только если в ней
-  НЕТ ни одного китайского иероглифа и есть русские буквы.
+  НЕТ ни одного китайского иероглифа и есть буквы целевого языка.
 - Незавершённые строки content.json помечаются "fail" в
   translate_progress.json -> "__content_items__" и доделываются
   при следующем запуске.
 
 Запуск:
-    python translate.py                       # всё: content.json + страницы
-    python translate.py --content             # только content.json (добьёт fails)
-    python translate.py --pages               # только страницы
-    python translate.py --force-content       # сбросить прогресс content.json
+    python translate.py                       # всё: content.json + страницы (ru)
+    python translate.py --content             # только content.json (ru)
+    python translate.py --pages               # только страницы (ru)
+    python translate.py --force-content       # сбросить прогресс content.json (ru)
+    python translate.py --en                  # перевод на английский (en_pages, content.en.json)
+    python translate.py --en --pages          # только страницы на английский
+    python translate.py --en --content        # только content.json на английский
+    python translate.py --en --force-content  # сбросить прогресс content.json (en)
 """
 
 import re
@@ -40,7 +44,7 @@ from config import (
 # Логирование
 # ============================================================
 
-def setup_logger(out_root: Path) -> logging.Logger:
+def setup_logger(out_root: Path, suffix: str = "") -> logging.Logger:
     logger = logging.getLogger("translate")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
@@ -51,13 +55,61 @@ def setup_logger(out_root: Path) -> logging.Logger:
     ch.setFormatter(fmt)
     logger.addHandler(ch)
 
-    fh = logging.FileHandler(out_root / "translate.log", encoding="utf-8")
+    log_name = f"translate{suffix}.log"
+    fh = logging.FileHandler(out_root / log_name, encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
 
 
 log = logging.getLogger("translate")
+
+
+# ============================================================
+# Языковые профили
+# ============================================================
+
+class LangProfile:
+    """
+    Описывает целевой язык перевода:
+      - code:         код языка для Google ('ru' / 'en')
+      - letter_re:    регулярка "буквы целевого языка" (для проверки)
+      - pages_dir:    имя каталога с переведёнными страницами
+      - content_out:  имя итогового content-файла
+      - progress:     имя файла прогресса
+      - log_suffix:   суффикс для лог-файла
+      - name_ru:      как называть язык в логах
+    """
+    def __init__(self, code, letter_re, pages_dir, content_out,
+                 progress, log_suffix, name_ru):
+        self.code = code
+        self.letter_re = letter_re
+        self.pages_dir = pages_dir
+        self.content_out = content_out
+        self.progress = progress
+        self.log_suffix = log_suffix
+        self.name_ru = name_ru
+
+
+RU_PROFILE = LangProfile(
+    code="ru",
+    letter_re=re.compile(r"[а-яА-Я]"),
+    pages_dir="ru_pages",
+    content_out="content.ru.json",
+    progress="translate_progress.json",
+    log_suffix="",
+    name_ru="русский",
+)
+
+EN_PROFILE = LangProfile(
+    code="en",
+    letter_re=re.compile(r"[a-zA-Z]"),
+    pages_dir="en_pages",
+    content_out="content.en.json",
+    progress="translate_progress.en.json",
+    log_suffix=".en",
+    name_ru="английский",
+)
 
 
 # ============================================================
@@ -82,7 +134,7 @@ class TranslateProgress:
                 ok = sum(1 for v in self.data.values() if v == "ok")
                 log.info(f"📂 Прогресс: {ok} ok / {len(self.data)} записей")
             except Exception as e:
-                log.warning(f"Не загрузился translate_progress.json: {e}")
+                log.warning(f"Не загрузился {path.name}: {e}")
 
     def save(self):
         self.path.write_text(
@@ -121,7 +173,6 @@ class TranslateProgress:
 # ============================================================
 
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
-RU_RE = re.compile(r"[а-яА-Я]")
 
 # текст между тегами (не атрибуты)
 TEXT_NODE_RE = re.compile(r">([^<>]*)<", re.S)
@@ -130,23 +181,25 @@ def _has_chinese(s: str) -> bool:
     return bool(s) and bool(CJK_RE.search(s))
 
 def _has_russian(s: str) -> bool:
-    return bool(s) and bool(RU_RE.search(s))
+    return bool(s) and bool(RU_PROFILE.letter_re.search(s))
 
-def _is_translated(s: str) -> bool:
+def _is_translated(s: str, profile: LangProfile) -> bool:
     if not s:
         return False
     if CJK_RE.search(s):
         return False
-    return bool(RU_RE.search(s))
+    return bool(profile.letter_re.search(s))
 
 
 # ============================================================
 # JS-хелпер Google Translate
 # ============================================================
 
-TRANSLATE_SCRIPT = r"""
+TRANSLATE_SCRIPT_TEMPLATE = r"""
 (() => {
   if (window.__gt_ready) return;
+
+  const TARGET_LANG = '__TARGET_LANG__';
 
   if (!document.getElementById('google_translate_element')) {
     const div = document.createElement('div');
@@ -158,7 +211,7 @@ TRANSLATE_SCRIPT = r"""
   window.googleTranslateElementInit = function () {
     try {
       new google.translate.TranslateElement(
-        { pageLanguage: 'zh-CN', includedLanguages: 'ru', autoDisplay: false },
+        { pageLanguage: 'zh-CN', includedLanguages: TARGET_LANG, autoDisplay: false },
         'google_translate_element'
       );
     } catch (e) {
@@ -178,14 +231,17 @@ TRANSLATE_SCRIPT = r"""
     }
   }, 200);
 
-  window.__translateToRussian = () => new Promise((resolve) => {
+  window.__translateToTarget = () => new Promise((resolve) => {
     const combo = document.querySelector('.goog-te-combo');
     if (!combo) { resolve(false); return; }
 
-    combo.value = 'ru';
+    combo.value = TARGET_LANG;
     combo.dispatchEvent(new Event('change', { bubbles: true }));
 
-    let lastRu = -1;
+    // счётчик "букв" целевого языка — для en это латиница,
+    // но чтобы не путаться с исходным кодом страницы, считаем
+    // по факту наличия перевода через API-атрибут.
+    let lastCount = -1;
     let stable = 0;
     let ticks = 0;
     const MAX_TICKS = 240;
@@ -194,27 +250,37 @@ TRANSLATE_SCRIPT = r"""
     const checker = setInterval(() => {
       ticks++;
       const text = document.body.innerText || '';
-      const ru = (text.match(/[а-яА-Я]/g) || []).length;
+      let count;
+      if (TARGET_LANG === 'ru') {
+        count = (text.match(/[а-яА-Я]/g) || []).length;
+      } else {
+        // для английского считаем латиницу, но отсекаем случай,
+        // когда на странице вообще нет непустого текста
+        count = (text.match(/[a-zA-Z]/g) || []).length;
+      }
 
-      if (ru > 0 && ru === lastRu) {
+      if (count > 0 && count === lastCount) {
         stable++;
       } else {
         stable = 0;
       }
-      lastRu = ru;
+      lastCount = count;
 
       if (stable >= STABLE_NEEDED || ticks >= MAX_TICKS) {
         clearInterval(checker);
-        resolve(ru > 0);
+        resolve(count > 0);
       }
     }, 250);
   });
 })();
 """
 
+def _translate_script(target_lang: str) -> str:
+    return TRANSLATE_SCRIPT_TEMPLATE.replace("__TARGET_LANG__", target_lang)
 
-def ensure_translator(page, timeout=TRANSLATE_TIMEOUT):
-    page.evaluate(TRANSLATE_SCRIPT)
+
+def ensure_translator(page, target_lang: str, timeout=TRANSLATE_TIMEOUT):
+    page.evaluate(_translate_script(target_lang))
 
     start = time.time()
     while time.time() - start < timeout:
@@ -257,7 +323,7 @@ def _put_html_into_holder(page, html: str):
 
 def translate_html_in_browser(page, html: str) -> str:
     _put_html_into_holder(page, html)
-    ok = page.evaluate("() => window.__translateToRussian()")
+    ok = page.evaluate("() => window.__translateToTarget()")
     if not ok:
         log.warning("   ⚠️  Похоже, перевод не применился")
     time.sleep(0.4)
@@ -273,9 +339,9 @@ def _html_text(html: str) -> str:
     return text
 
 
-def _page_translation_ok(html: str) -> bool:
+def _page_translation_ok(html: str, profile: LangProfile) -> bool:
     text = _html_text(html)
-    if not RU_RE.search(text):
+    if not profile.letter_re.search(text):
         return False
     if CJK_RE.search(text):
         return False
@@ -286,7 +352,8 @@ def _page_translation_ok(html: str) -> bool:
 # Постобработка: перевод оставшихся CJK (например, в SVG <text>)
 # ============================================================
 
-def fix_leftover_cjk(page, html: str, max_rounds: int = 3) -> str:
+def fix_leftover_cjk(page, html: str, profile: LangProfile,
+                     max_rounds: int = 3) -> str:
     """
     Google Translate Element не трогает текст внутри SVG (<text>/<tspan>).
     Находим все текстовые узлы с CJK, переводим их отдельным запросом
@@ -323,12 +390,12 @@ def fix_leftover_cjk(page, html: str, max_rounds: int = 3) -> str:
 
         # переводим
         src_list = [t for _, _, t in matches]
-        ru_list = google_translate_strings(page, src_list)
+        ru_list = google_translate_strings(page, src_list, profile)
 
         # собираем новый html справа налево, чтобы не сбить индексы
         result = protected
         for (start, end, orig), ru in reversed(list(zip(matches, ru_list))):
-            if ru is None or not _is_translated(ru):
+            if ru is None or not _is_translated(ru, profile):
                 continue
             result = result[:start] + ru + result[end:]
 
@@ -349,7 +416,8 @@ def fix_leftover_cjk(page, html: str, max_rounds: int = 3) -> str:
 # Перевод одной HTML-страницы
 # ============================================================
 
-def translate_page_file(page, src_file: Path, dst_file: Path) -> bool:
+def translate_page_file(page, src_file: Path, dst_file: Path,
+                        profile: LangProfile) -> bool:
     html = src_file.read_text(encoding="utf-8")
 
     hide_css = (
@@ -366,12 +434,12 @@ def translate_page_file(page, src_file: Path, dst_file: Path) -> bool:
         html = hide_css + html
 
     translated = translate_html_in_browser(page, html)
-    translated = fix_leftover_cjk(page, translated)
+    translated = fix_leftover_cjk(page, translated, profile)
 
     dst_file.parent.mkdir(parents=True, exist_ok=True)
     dst_file.write_text(translated, encoding="utf-8")
 
-    ok = _page_translation_ok(translated)
+    ok = _page_translation_ok(translated, profile)
     if not ok:
         leftover = CJK_RE.findall(_html_text(translated))
         log.warning(
@@ -384,7 +452,8 @@ def translate_page_file(page, src_file: Path, dst_file: Path) -> bool:
 # Перевод набора строк через Google (с якорями)
 # ============================================================
 
-def google_translate_strings(page, strings: list) -> list:
+def google_translate_strings(page, strings: list,
+                             profile: LangProfile) -> list:
     """
     Переводит список строк через Google Translate Element.
     Возвращает список той же длины; для непереведённых — None,
@@ -407,7 +476,7 @@ def google_translate_strings(page, strings: list) -> list:
         html = "<div id='__tr'>" + "".join(parts) + "</div>"
 
         _put_html_into_holder(page, html)
-        page.evaluate("() => window.__translateToRussian()")
+        page.evaluate("() => window.__translateToTarget()")
         time.sleep(0.4)
 
         translated = page.evaluate(
@@ -427,7 +496,7 @@ def google_translate_strings(page, strings: list) -> list:
 
         for j, src in enumerate(chunk):
             ru = (got.get(j) or "").strip()
-            if _is_translated(ru):
+            if _is_translated(ru, profile):
                 results[i + j] = ru
 
         log.info(f"   🔤 [{min(i+BATCH, len(strings))}/{len(strings)}] обработано")
@@ -440,7 +509,8 @@ def google_translate_strings(page, strings: list) -> list:
 # ============================================================
 
 def translate_content_json(page, src_json: Path, dst_json: Path,
-                           progress: TranslateProgress):
+                           progress: TranslateProgress,
+                           profile: LangProfile):
     data = json.loads(src_json.read_text(encoding="utf-8"))
 
     to_translate = {}
@@ -491,7 +561,7 @@ def translate_content_json(page, src_json: Path, dst_json: Path,
 
     pending_keys = []
     for k in order:
-        if progress.content_item_is_ok(k) and _is_translated(existing_mapping.get(k, "")):
+        if progress.content_item_is_ok(k) and _is_translated(existing_mapping.get(k, ""), profile):
             continue
         pending_keys.append(k)
 
@@ -500,10 +570,10 @@ def translate_content_json(page, src_json: Path, dst_json: Path,
 
     if pending_keys:
         src_list = [to_translate[k] for k in pending_keys]
-        ru_list = google_translate_strings(page, src_list)
+        ru_list = google_translate_strings(page, src_list, profile)
 
         for k, ru in zip(pending_keys, ru_list):
-            if ru is not None and _is_translated(ru):
+            if ru is not None and _is_translated(ru, profile):
                 existing_mapping[k] = ru
                 progress.content_item_set(k, "ok")
             else:
@@ -581,36 +651,41 @@ def main():
     only_content = "--content" in sys.argv
     only_pages = "--pages" in sys.argv
     force_content = "--force-content" in sys.argv
+    to_english = "--en" in sys.argv
+
+    profile = EN_PROFILE if to_english else RU_PROFILE
 
     out_root = Path(OUTPUT_DIR) / DOC_ID
-    setup_logger(out_root)
+    setup_logger(out_root, suffix=profile.log_suffix)
 
     pages_dir = out_root / "pages"
-    ru_pages_dir = out_root / "ru_pages"
+    ru_pages_dir = out_root / profile.pages_dir
     ru_pages_dir.mkdir(parents=True, exist_ok=True)
 
-    progress = TranslateProgress(out_root / "translate_progress.json")
+    progress = TranslateProgress(out_root / profile.progress)
     if force_content:
         progress.reset_content()
 
+    log.info(f"🌐 Целевой язык: {profile.name_ru} ({profile.code})")
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=False,
+            headless=True,
             args=[
-                "--lang=ru-RU",
+                f"--lang={profile.code}-{profile.code.upper()}",
                 "--disable-blink-features=AutomationControlled",
             ],
         )
         context = browser.new_context(
             user_agent=USER_AGENT,
-            locale="ru-RU",
+            locale=f"{profile.code}-{profile.code.upper()}",
             viewport={"width": 1400, "height": 900},
         )
         page = context.new_page()
 
-        log.info("🔤 Инициализируем Google Translate...")
+        log.info(f"🔤 Инициализируем Google Translate ({profile.code})...")
         page.goto("https://example.com", wait_until="domcontentloaded")
-        ensure_translator(page, timeout=60)
+        ensure_translator(page, profile.code, timeout=60)
         log.info("✅ Переводчик готов")
 
         interrupted = {"v": False}
@@ -624,17 +699,17 @@ def main():
         try:
             if not only_pages:
                 src_json = out_root / "content.json"
-                dst_json = out_root / "content.ru.json"
+                dst_json = out_root / profile.content_out
 
                 if progress.is_ok("__content__") and dst_json.exists():
                     log.info("⏭️  content.json уже переведён полностью")
                 elif not src_json.exists():
                     log.warning("⚠️  content.json не найден — пропускаем")
                 else:
-                    log.info("📄 Переводим content.json через Google...")
+                    log.info(f"📄 Переводим content.json на {profile.name_ru}...")
                     try:
                         translate_content_json(
-                            page, src_json, dst_json, progress
+                            page, src_json, dst_json, progress, profile
                         )
                     except Exception as e:
                         log.error(f"Ошибка перевода content.json: {e}",
@@ -661,7 +736,7 @@ def main():
 
                     log.info(f"[{i}/{total}] 🔄 {pid}")
                     try:
-                        ok = translate_page_file(page, src, dst)
+                        ok = translate_page_file(page, src, dst, profile)
                         if ok:
                             progress.set(pid, "ok")
                             done += 1
