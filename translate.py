@@ -1,16 +1,22 @@
 # translate.py
 """
-Перевод уже скачанных страниц и content.json.
+Перевод уже скачанных страниц и content.json через Google Translate Element.
 
-- content.json и HTML-страницы переводятся через Google Translate Element
-  в браузере (Playwright + Chromium).
-- Ведётся translate_progress.json: { id: "ok" | "fail" }.
+Особенности:
+- Переводятся в том числе текстовые узлы внутри SVG (<text>/<tspan>),
+  которые Google Translate Element по умолчанию игнорирует — через
+  постобработку: находим оставшиеся CJK, переводим отдельно, вставляем.
+- Строка/страница считается переведённой ("ok") только если в ней
+  НЕТ ни одного китайского иероглифа и есть русские буквы.
+- Незавершённые строки content.json помечаются "fail" в
+  translate_progress.json -> "__content_items__" и доделываются
+  при следующем запуске.
 
 Запуск:
-    python translate.py                  # всё: content.json + страницы
-    python translate.py --content        # только content.json
-    python translate.py --pages          # только страницы
-    python translate.py --force-content  # перевести content.json заново
+    python translate.py                       # всё: content.json + страницы
+    python translate.py --content             # только content.json (добьёт fails)
+    python translate.py --pages               # только страницы
+    python translate.py --force-content       # сбросить прогресс content.json
 """
 
 import re
@@ -59,7 +65,13 @@ log = logging.getLogger("translate")
 # ============================================================
 
 class TranslateProgress:
-    """{ "page_id": "ok" | "fail", "__content__": "ok" | "fail" }"""
+    """
+    {
+      "page_id": "ok" | "fail",
+      "__content__": "ok" | "fail",
+      "__content_items__": { "tree[0].name_zh": "ok" | "fail", ... }
+    }
+    """
 
     def __init__(self, path: Path):
         self.path = path
@@ -81,13 +93,26 @@ class TranslateProgress:
     def is_ok(self, key: str) -> bool:
         return self.data.get(key) == "ok"
 
-    def reset(self, key: str):
-        if key in self.data:
-            del self.data[key]
-            self.save()
-
     def set(self, key: str, status: str):
         self.data[key] = status
+        self.save()
+
+    def content_items(self) -> dict:
+        v = self.data.get("__content_items__")
+        if not isinstance(v, dict):
+            v = {}
+            self.data["__content_items__"] = v
+        return v
+
+    def content_item_is_ok(self, key: str) -> bool:
+        return self.content_items().get(key) == "ok"
+
+    def content_item_set(self, key: str, status: str):
+        self.content_items()[key] = status
+
+    def reset_content(self):
+        self.data.pop("__content__", None)
+        self.data.pop("__content_items__", None)
         self.save()
 
 
@@ -98,11 +123,21 @@ class TranslateProgress:
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 RU_RE = re.compile(r"[а-яА-Я]")
 
+# текст между тегами (не атрибуты)
+TEXT_NODE_RE = re.compile(r">([^<>]*)<", re.S)
+
 def _has_chinese(s: str) -> bool:
     return bool(s) and bool(CJK_RE.search(s))
 
 def _has_russian(s: str) -> bool:
     return bool(s) and bool(RU_RE.search(s))
+
+def _is_translated(s: str) -> bool:
+    if not s:
+        return False
+    if CJK_RE.search(s):
+        return False
+    return bool(RU_RE.search(s))
 
 
 # ============================================================
@@ -231,11 +266,90 @@ def translate_html_in_browser(page, html: str) -> str:
     )
 
 
+def _html_text(html: str) -> str:
+    html = re.sub(r"(?is)<script.*?</script>", " ", html)
+    html = re.sub(r"(?is)<style.*?</style>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", html)
+    return text
+
+
+def _page_translation_ok(html: str) -> bool:
+    text = _html_text(html)
+    if not RU_RE.search(text):
+        return False
+    if CJK_RE.search(text):
+        return False
+    return True
+
+
+# ============================================================
+# Постобработка: перевод оставшихся CJK (например, в SVG <text>)
+# ============================================================
+
+def fix_leftover_cjk(page, html: str, max_rounds: int = 3) -> str:
+    """
+    Google Translate Element не трогает текст внутри SVG (<text>/<tspan>).
+    Находим все текстовые узлы с CJK, переводим их отдельным запросом
+    через тот же Google и подставляем обратно по индексам.
+
+    Делаем до max_rounds раундов, потому что после подстановки могут
+    обнаружиться новые (вложенные/смежные) узлы.
+    """
+    for round_no in range(1, max_rounds + 1):
+        # прячем <script> и <style>, чтобы не зацепить их содержимое
+        placeholders = {}
+        def hide(m, _ph=placeholders):
+            key = f"\x00H{len(_ph)}\x00"
+            _ph[key] = m.group(0)
+            return key
+
+        protected = re.sub(r"(?is)<script.*?</script>", hide, html)
+        protected = re.sub(r"(?is)<style.*?</style>", hide, protected)
+
+        # находим текстовые узлы с CJK
+        matches = []
+        for m in TEXT_NODE_RE.finditer(protected):
+            text = m.group(1)
+            if _has_chinese(text):
+                matches.append((m.start(1), m.end(1), text))
+
+        if not matches:
+            # вернём скрипты/стили
+            for k, v in placeholders.items():
+                protected = protected.replace(k, v)
+            return protected
+
+        log.info(f"   🧩 Раунд {round_no}: CJK-текстовых узлов: {len(matches)}")
+
+        # переводим
+        src_list = [t for _, _, t in matches]
+        ru_list = google_translate_strings(page, src_list)
+
+        # собираем новый html справа налево, чтобы не сбить индексы
+        result = protected
+        for (start, end, orig), ru in reversed(list(zip(matches, ru_list))):
+            if ru is None or not _is_translated(ru):
+                continue
+            result = result[:start] + ru + result[end:]
+
+        # вернём скрипты/стили
+        for k, v in placeholders.items():
+            result = result.replace(k, v)
+
+        html = result
+
+        # если CJK больше не осталось — выходим
+        if not CJK_RE.search(_html_text(html)):
+            return html
+
+    return html
+
+
 # ============================================================
 # Перевод одной HTML-страницы
 # ============================================================
 
-def translate_page_file(page, src_file: Path, dst_file: Path):
+def translate_page_file(page, src_file: Path, dst_file: Path) -> bool:
     html = src_file.read_text(encoding="utf-8")
 
     hide_css = (
@@ -252,9 +366,18 @@ def translate_page_file(page, src_file: Path, dst_file: Path):
         html = hide_css + html
 
     translated = translate_html_in_browser(page, html)
+    translated = fix_leftover_cjk(page, translated)
 
     dst_file.parent.mkdir(parents=True, exist_ok=True)
     dst_file.write_text(translated, encoding="utf-8")
+
+    ok = _page_translation_ok(translated)
+    if not ok:
+        leftover = CJK_RE.findall(_html_text(translated))
+        log.warning(
+            f"   ⚠️  Остались китайские символы: {len(leftover)} шт."
+        )
+    return ok
 
 
 # ============================================================
@@ -264,22 +387,22 @@ def translate_page_file(page, src_file: Path, dst_file: Path):
 def google_translate_strings(page, strings: list) -> list:
     """
     Переводит список строк через Google Translate Element.
-    Использует якоря data-k, чтобы жёстко сопоставить вход и выход.
-    Возвращает список той же длины; для непереведённых — оригинал.
+    Возвращает список той же длины; для непереведённых — None,
+    чтобы вызывающий код мог пометить "fail".
     """
     if not strings:
         return []
 
-    results = list(strings)
+    results = [None] * len(strings)
     BATCH = 40
+
+    def esc(x):
+        return (x.replace("&", "&amp;")
+                 .replace("<", "&lt;")
+                 .replace(">", "&gt;"))
 
     for i in range(0, len(strings), BATCH):
         chunk = strings[i:i + BATCH]
-        # экранируем HTML-спецсимволы
-        def esc(x):
-            return (x.replace("&", "&amp;")
-                     .replace("<", "&lt;")
-                     .replace(">", "&gt;"))
         parts = [f'<p data-k="{j}">{esc(s)}</p>' for j, s in enumerate(chunk)]
         html = "<div id='__tr'>" + "".join(parts) + "</div>"
 
@@ -294,7 +417,6 @@ def google_translate_strings(page, strings: list) -> list:
                          t: p.textContent.trim()}))"""
         )
 
-        # индекс -> перевод
         got = {}
         for item in translated:
             try:
@@ -304,14 +426,11 @@ def google_translate_strings(page, strings: list) -> list:
             got[k] = item["t"]
 
         for j, src in enumerate(chunk):
-            ru = got.get(j, "").strip()
-            if ru and _has_russian(ru):
+            ru = (got.get(j) or "").strip()
+            if _is_translated(ru):
                 results[i + j] = ru
-            else:
-                # fallback: оставляем китайский, чтобы не потерять данные
-                results[i + j] = src
 
-        log.info(f"   🔤 [{min(i+BATCH, len(strings))}/{len(strings)}] переведено")
+        log.info(f"   🔤 [{min(i+BATCH, len(strings))}/{len(strings)}] обработано")
 
     return results
 
@@ -320,11 +439,10 @@ def google_translate_strings(page, strings: list) -> list:
 # Перевод content.json
 # ============================================================
 
-def translate_content_json(page, src_json: Path, dst_json: Path):
+def translate_content_json(page, src_json: Path, dst_json: Path,
+                           progress: TranslateProgress):
     data = json.loads(src_json.read_text(encoding="utf-8"))
 
-    # ---------- 1. Собираем ВСЕ китайские строки ----------
-    # key -> китайский текст
     to_translate = {}
     order = []
 
@@ -337,13 +455,11 @@ def translate_content_json(page, src_json: Path, dst_json: Path):
         to_translate[key] = text
         order.append(key)
 
-    # --- имя руководства (doc_title и альтернативы) ---
     for field in ("doc_title", "title_zh", "title", "name_zh", "name"):
         v = data.get(field)
         if isinstance(v, str):
             add(f"__doc__.{field}", v)
 
-    # --- дерево ---
     def collect_tree(node, path):
         for field in ("name_zh", "name", "title_zh", "title"):
             v = node.get(field)
@@ -355,7 +471,6 @@ def translate_content_json(page, src_json: Path, dst_json: Path):
     for idx, top in enumerate(data.get("tree", []) or []):
         collect_tree(top, f"tree[{idx}]")
 
-    # --- flat_pages ---
     for pid, item in (data.get("flat_pages") or {}).items():
         if not isinstance(item, dict):
             continue
@@ -365,34 +480,48 @@ def translate_content_json(page, src_json: Path, dst_json: Path):
                 add(f"flat_pages[{pid}].{field}", v)
 
     log.info(f"   🔤 Уникальных китайских строк: {len(order)}")
-    if not order:
-        data["translated_at"] = datetime.now().isoformat(timespec="seconds")
-        dst_json.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        log.info(f"   💾 {dst_json} (нечего переводить)")
-        return
 
-    # ---------- 2. Переводим через Google ----------
-    src_list = [to_translate[k] for k in order]
-    ru_list = google_translate_strings(page, src_list)
-    mapping = dict(zip(order, ru_list))
+    existing_mapping = {}
+    if dst_json.exists():
+        try:
+            prev = json.loads(dst_json.read_text(encoding="utf-8"))
+            existing_mapping = prev.get("__translations__", {}) or {}
+        except Exception as e:
+            log.warning(f"Не удалось прочитать старый {dst_json.name}: {e}")
 
-    # ---------- 3. Применяем ----------
-    # doc_title
+    pending_keys = []
+    for k in order:
+        if progress.content_item_is_ok(k) and _is_translated(existing_mapping.get(k, "")):
+            continue
+        pending_keys.append(k)
+
+    log.info(f"   🧩 К переводу сейчас: {len(pending_keys)} "
+             f"(уже ok: {len(order) - len(pending_keys)})")
+
+    if pending_keys:
+        src_list = [to_translate[k] for k in pending_keys]
+        ru_list = google_translate_strings(page, src_list)
+
+        for k, ru in zip(pending_keys, ru_list):
+            if ru is not None and _is_translated(ru):
+                existing_mapping[k] = ru
+                progress.content_item_set(k, "ok")
+            else:
+                existing_mapping[k] = to_translate[k]
+                progress.content_item_set(k, "fail")
+        progress.save()
+
+    mapping = existing_mapping
+
     for field in ("doc_title", "title_zh", "title", "name_zh", "name"):
         k = f"__doc__.{field}"
         if k in mapping:
             ru_field = "doc_title_ru" if field == "doc_title" else f"{field}_ru"
             data[ru_field] = mapping[k]
-    # если в исходнике был doc_title — гарантируем doc_title_ru
     if isinstance(data.get("doc_title"), str) and "doc_title_ru" not in data:
         data["doc_title_ru"] = data["doc_title"]
 
-    # tree
     def apply_tree(node, path):
-        # name_ru — из name_zh или name
         for field in ("name_zh", "name", "title_zh", "title"):
             k = f"{path}.{field}"
             if k in mapping:
@@ -409,7 +538,6 @@ def translate_content_json(page, src_json: Path, dst_json: Path):
     for idx, top in enumerate(data.get("tree", []) or []):
         apply_tree(top, f"tree[{idx}]")
 
-    # flat_pages
     for pid, item in (data.get("flat_pages") or {}).items():
         if not isinstance(item, dict):
             continue
@@ -424,6 +552,7 @@ def translate_content_json(page, src_json: Path, dst_json: Path):
                 (item.get("name_zh") or item.get("name") or "").strip(),
             )
 
+    data["__translations__"] = mapping
     data["translated_at"] = datetime.now().isoformat(timespec="seconds")
     data["translated_by"] = "google-translate-element"
     dst_json.write_text(
@@ -431,6 +560,17 @@ def translate_content_json(page, src_json: Path, dst_json: Path):
         encoding="utf-8",
     )
     log.info(f"   💾 {dst_json}")
+
+    fails = [k for k in order if not progress.content_item_is_ok(k)]
+    log.info(f"   📊 content.json: ok={len(order)-len(fails)}, fail={len(fails)}")
+    if fails:
+        log.warning("   ⚠️  Не переведены (будут добиты при след. запуске):")
+        for k in fails[:10]:
+            log.warning(f"      • {k} = {to_translate[k][:60]!r}")
+        if len(fails) > 10:
+            log.warning(f"      ... и ещё {len(fails)-10}")
+
+    progress.set("__content__", "ok" if not fails else "fail")
 
 
 # ============================================================
@@ -451,7 +591,7 @@ def main():
 
     progress = TranslateProgress(out_root / "translate_progress.json")
     if force_content:
-        progress.reset("__content__")
+        progress.reset_content()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -482,25 +622,25 @@ def main():
         signal.signal(signal.SIGINT, on_sigint)
 
         try:
-            # ---------- 1. content.json ----------
             if not only_pages:
                 src_json = out_root / "content.json"
                 dst_json = out_root / "content.ru.json"
+
                 if progress.is_ok("__content__") and dst_json.exists():
-                    log.info("⏭️  content.json уже переведён")
+                    log.info("⏭️  content.json уже переведён полностью")
                 elif not src_json.exists():
                     log.warning("⚠️  content.json не найден — пропускаем")
                 else:
                     log.info("📄 Переводим content.json через Google...")
                     try:
-                        translate_content_json(page, src_json, dst_json)
-                        progress.set("__content__", "ok")
+                        translate_content_json(
+                            page, src_json, dst_json, progress
+                        )
                     except Exception as e:
                         log.error(f"Ошибка перевода content.json: {e}",
                                   exc_info=True)
                         progress.set("__content__", "fail")
 
-            # ---------- 2. страницы ----------
             if not only_content:
                 page_files = sorted(pages_dir.glob("*.html"))
                 total = len(page_files)
@@ -521,9 +661,13 @@ def main():
 
                     log.info(f"[{i}/{total}] 🔄 {pid}")
                     try:
-                        translate_page_file(page, src, dst)
-                        progress.set(pid, "ok")
-                        done += 1
+                        ok = translate_page_file(page, src, dst)
+                        if ok:
+                            progress.set(pid, "ok")
+                            done += 1
+                        else:
+                            progress.set(pid, "fail")
+                            failed += 1
                     except Exception as e:
                         log.error(f"Ошибка {pid}: {e}", exc_info=True)
                         progress.set(pid, "fail")
