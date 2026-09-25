@@ -10,7 +10,7 @@
   - _listing.html — листинг страниц папки с колонкой Title и поиском.
   - Закладки: в pywebview-режиме хранятся в файле через Python-мост;
     в обычном браузере / file:// — в localStorage.
-  - Кнопка «Отблагодарить автора» (заглушка).
+  - Кнопка «Отблагодарить автора» — контакты и реквизиты с копированием.
   - Кнопка «🌐 В браузере» и ярлычок с адресом локального сервера
     (работает только при запуске через launcher.py на pywebview).
 """
@@ -88,15 +88,16 @@ def collect_pages(nodes, acc=None):
 
 VIEWER_CSS = r"""
 /* _viewer.css — стили контента для страниц руководства */
+*, *::before, *::after { box-sizing: border-box; }
+
 html, body {
     margin: 0 !important;
     padding: 0 !important;
     max-width: none !important;
     width: 100% !important;
-    overflow-x: hidden !important;
 }
 body {
-    padding: 24px 32px 48px 32px !important;
+    padding: 24px 40px 48px 32px !important;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
                  Roboto, "Helvetica Neue", Arial, sans-serif;
     font-size: 15px;
@@ -106,6 +107,8 @@ body {
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     letter-spacing: 0.005em;
+    overflow-x: auto;
+    overflow-y: auto;
 }
 
 h1, h2, h3, h4, h5, h6 {
@@ -152,6 +155,8 @@ pre {
     border-radius: 6px;
     padding: 12px 16px;
     overflow-x: auto;
+    max-width: 100%;
+    box-sizing: border-box;
     line-height: 1.5;
 }
 pre code { background: transparent; padding: 0; border-radius: 0; font-size: .86em; }
@@ -159,11 +164,13 @@ pre code { background: transparent; padding: 0; border-radius: 0; font-size: .86
 /* ---------- Таблицы ---------- */
 .__table_wrap {
     width: 100%;
+    max-width: 100%;
     overflow-x: auto;
     margin: 1em 0;
     border: 1px solid #d0d7de;
     border-radius: 8px;
     background: #fff;
+    box-sizing: border-box;
 }
 table {
     border-collapse: collapse;
@@ -200,6 +207,7 @@ img, svg, video {
     opacity: 1;
     transition: opacity .2s ease-in;
     border-radius: 6px;
+    box-sizing: border-box;
 }
 img.loaded, svg.loaded, video.loaded { opacity: 1; }
 img[data-small="1"] {
@@ -635,6 +643,9 @@ INDEX_TEMPLATE = r"""<!DOCTYPE html>
       font-size: 11px; font-weight: 600;
   }
   .tb-btn.active .count { background: #ffc107; color: #856404; }
+  .tb-btn.copied {
+      background: #d4edda; border-color: #28a745; color: #155724;
+  }
 
   #server-url {
       display: none;
@@ -669,7 +680,7 @@ INDEX_TEMPLATE = r"""<!DOCTYPE html>
       overflow: hidden;
   }
   .modal.bookmarks { width: 680px; }
-  .modal.donate { width: 480px; }
+  .modal.donate { width: 560px; }
   .modal-head {
       padding: 12px 18px; background: #f6f8fa;
       border-bottom: 1px solid #e6e8eb;
@@ -778,12 +789,108 @@ INDEX_TEMPLATE = r"""<!DOCTYPE html>
       display: block; margin-top: 4px;
   }
 
-  /* donate placeholder */
-  .donate-body {
-      text-align: center; padding: 30px 20px; color: #57606a;
+  /* ---------- donate (расширенная версия) ---------- */
+  .donate-hero {
+      text-align: center;
+      padding: 6px 8px 18px;
+      color: #57606a;
   }
-  .donate-body .icon { font-size: 42px; margin-bottom: 10px; }
-  .donate-body .msg { font-size: 14px; line-height: 1.6; }
+  .donate-hero .icon { font-size: 40px; line-height: 1; margin-bottom: 8px; }
+  .donate-hero .msg  { font-size: 14px; line-height: 1.6; }
+
+  .donate-section {
+      border: 1px solid #e6e8eb;
+      border-radius: 10px;
+      padding: 10px 12px 12px;
+      margin: 0 0 12px;
+      background: #fff;
+  }
+  .donate-section-title {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      color: #8b949e;
+      margin: 0 0 8px 2px;
+  }
+
+  .donate-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 7px 8px;
+      border-radius: 8px;
+      transition: background .15s;
+  }
+  .donate-row + .donate-row { margin-top: 2px; }
+  .donate-row:hover { background: #f6f8fa; }
+
+  .donate-role {
+      flex: 0 0 92px;
+      font-size: 12px;
+      color: #57606a;
+  }
+  .donate-value {
+      flex: 1;
+      min-width: 0;
+      font-size: 13.5px;
+      word-break: break-word;
+  }
+  .donate-name { font-weight: 600; color: #1f2328; }
+
+  .donate-link {
+      color: #0969da;
+      text-decoration: none;
+  }
+  .donate-link:hover { text-decoration: underline; }
+
+  .donate-iban {
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+                   Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+      background: #f6f8fa;
+      border: 1px solid #d0d7de;
+      border-radius: 6px;
+      padding: 3px 8px;
+      letter-spacing: .02em;
+      user-select: all;
+  }
+
+  .copy-mini {
+      flex: 0 0 auto;
+      border: 1px solid #d0d7de;
+      background: #fff;
+      color: #57606a;
+      cursor: pointer;
+      border-radius: 6px;
+      width: 28px;
+      height: 26px;
+      font-size: 12px;
+      line-height: 1;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: background .15s, border-color .15s, color .15s;
+      font-family: inherit;
+  }
+  .copy-mini:hover {
+      background: #eef5ff;
+      border-color: #0969da;
+      color: #0969da;
+  }
+  .copy-mini.copied {
+      background: #d4edda;
+      border-color: #28a745;
+      color: #155724;
+  }
+
+  .donate-sign {
+      text-align: right;
+      font-size: 12px;
+      color: #8b949e;
+      font-style: italic;
+      padding: 4px 6px 0;
+  }
 
   @media (max-width: 700px) {
       #sidebar { width: 100%; position: absolute; z-index: 10; height: 100%; }
@@ -916,7 +1023,7 @@ INDEX_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<!-- ============ Модалка: отблагодарить автора (заглушка) ============ -->
+<!-- ============ Модалка: отблагодарить автора ============ -->
 <div class="modal-back" id="donate-modal">
   <div class="modal donate">
     <div class="modal-head">
@@ -924,14 +1031,94 @@ INDEX_TEMPLATE = r"""<!DOCTYPE html>
       <button class="modal-x" onclick="closeModal('donate-modal')">×</button>
     </div>
     <div class="modal-body">
-      <div class="donate-body">
-        <div class="icon">💳</div>
+
+      <div class="donate-hero">
+        <div class="icon">💛</div>
         <div class="msg">
-          Тут методы оплаты и контакты.
+          Спасибо, что пользуетесь руководством!<br>
+          Если оно сэкономило вам время — можно угостить автора кофе.
         </div>
       </div>
+
+      <!-- ---------- Авторы ---------- -->
+      <div class="donate-section">
+        <div class="donate-section-title">Авторы проекта</div>
+
+        <div class="donate-row">
+          <div class="donate-role">Автор</div>
+          <div class="donate-value">
+            <span class="donate-name">xibolba Sr.</span>
+          </div>
+          <button class="copy-mini" data-copy="xibolba Sr."
+                  title="Скопировать">📋</button>
+        </div>
+
+        <div class="donate-row">
+          <div class="donate-role">Тестировщик</div>
+          <div class="donate-value">
+            <span class="donate-name">mehen Jr.</span>
+          </div>
+          <button class="copy-mini" data-copy="mehen Jr."
+                  title="Скопировать">📋</button>
+        </div>
+      </div>
+
+      <!-- ---------- Контакты ---------- -->
+      <div class="donate-section">
+        <div class="donate-section-title">Связь</div>
+
+        <div class="donate-row">
+          <div class="donate-role">Email</div>
+          <div class="donate-value">
+            <a class="donate-link" href="mailto:xibolba@yandex.by">
+              xibolba@yandex.by
+            </a>
+          </div>
+          <button class="copy-mini" data-copy="xibolba@yandex.by"
+                  title="Скопировать email">📋</button>
+        </div>
+
+        <div class="donate-row">
+          <div class="donate-role">Telegram</div>
+          <div class="donate-value">
+            <a class="donate-link" href="https://t.me/xibolba"
+               target="_blank" rel="noopener">
+              @xibolba
+            </a>
+          </div>
+          <button class="copy-mini" data-copy="@xibolba"
+                  title="Скопировать ник">📋</button>
+        </div>
+      </div>
+
+      <!-- ---------- Оплата ---------- -->
+      <div class="donate-section">
+        <div class="donate-section-title">Перевод на карту / IBAN</div>
+
+        <div class="donate-row donate-row-iban">
+          <div class="donate-role">ТехноБанк</div>
+          <div class="donate-value">
+            <code class="donate-iban"
+                  id="donate-iban">BY14TECN3014000000VVU0012052</code>
+          </div>
+          <button class="copy-mini" data-copy="BY14TECN3014000000VVU0012052"
+                  title="Скопировать IBAN">📋</button>
+        </div>
+
+        <div class="hint" style="margin-top:10px;">
+          IBAN можно вставить в приложении банка или в платёжном
+          поручении. Скопируйте одним кликом — кнопка 📋 справа.
+        </div>
+      </div>
+
+      <div class="donate-sign">— с уважением, xibolba Sr.</div>
+
     </div>
     <div class="modal-foot">
+      <button class="tb-btn" onclick="copyAllDonate()"
+              title="Скопировать все контакты и реквизиты одним текстом">
+        📋 Скопировать всё
+      </button>
       <button class="tb-btn" onclick="closeModal('donate-modal')">Закрыть</button>
     </div>
   </div>
@@ -1459,10 +1646,70 @@ function applyImportedBookmarks(data) {
 }
 
 /* ============================================================
-   Донат (заглушка)
+   Донат: открытие модалки и копирование реквизитов
    ============================================================ */
 function openDonate() {
     openModal("donate-modal");
+}
+
+/* Универсальное копирование: text + необязательная кнопка для анимации */
+function copyText(text, btnEl) {
+    var done = function () {
+        if (!btnEl) return;
+        btnEl.classList.add("copied");
+        var old = btnEl.textContent;
+        btnEl.textContent = "✓";
+        setTimeout(function () {
+            btnEl.classList.remove("copied");
+            btnEl.textContent = old;
+        }, 900);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, done);
+    } else {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand("copy"); } catch (e) {}
+        document.body.removeChild(ta);
+        done();
+    }
+}
+
+/* Делегирование клика по всем .copy-mini внутри донат-модалки */
+document.addEventListener("click", function (e) {
+    var btn = e.target.closest && e.target.closest("#donate-modal .copy-mini");
+    if (!btn) return;
+    e.preventDefault();
+    var text = btn.getAttribute("data-copy") || "";
+    if (text) copyText(text, btn);
+});
+
+/* «Скопировать всё» — единый текст с контактами и реквизитами */
+function copyAllDonate() {
+    var lines = [
+        "Руководство: " + DOC_TITLE,
+        "",
+        "Автор: xibolba Sr.",
+        "Тестировщик: mehen Jr.",
+        "Email: xibolba@yandex.by",
+        "Telegram: @xibolba",
+        "IBAN (ТехноБанк): BY14TECN3014000000VVU0012052"
+    ];
+    copyText(lines.join("\n"), null);
+    var foot = document.querySelector("#donate-modal .modal-foot .tb-btn");
+    if (foot) {
+        var old = foot.textContent;
+        foot.textContent = "✓ Скопировано";
+        foot.classList.add("copied");
+        setTimeout(function () {
+            foot.textContent = old;
+            foot.classList.remove("copied");
+        }, 1200);
+    }
 }
 
 /* ============================================================
